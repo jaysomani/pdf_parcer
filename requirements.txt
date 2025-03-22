@@ -1,0 +1,7 @@
+fastapi==0.95.1
+uvicorn==0.22.0
+psycopg2-binary==2.9.6
+boto3==1.26.114
+python-multipart
+mangum
+camelot-py
