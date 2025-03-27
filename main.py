@@ -14,9 +14,20 @@ import boto3
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
 app = FastAPI()
+
+# Add CORS middleware here:
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Add your frontend URL(s)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 handler = Mangum(app)
 
 # ---------------------------
