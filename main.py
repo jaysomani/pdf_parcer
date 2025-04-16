@@ -373,31 +373,32 @@ async def process_pdf(
             combined_df = pd.concat(list(page_tables.values()), ignore_index=True)
             print(f"[DEBUG] Combined DataFrame shape before merge_multiline_rows: {combined_df.shape}")
             
-            # For testing: if you want to return raw data before renaming,
-            # uncomment the following lines:
-            raw_data = combined_df.to_dict(orient="records")
-            return JSONResponse(status_code=200, content={"status": "raw", "data": raw_data})
+            # Merge multiline rows and return the result for debugging raw merged data
+            merged_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
+            print(f"[DEBUG] Merged DataFrame shape: {merged_df.shape}")
+            # For testing: return the raw merged data as JSON
+            raw_merged = merged_df.to_dict(orient="records")
+            return JSONResponse(status_code=200, content={"status": "merged_raw", "data": raw_merged})
             
-            combined_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
-            combined_df.drop_duplicates(inplace=True)
-            filtered_df = filter_valid_transactions(combined_df)
-            df = filtered_df
-            
-            # ------ Post processing: rename columns for clarity ------
-            df = df.rename(columns={
-                0: "date",
-                2: "description",
-                4: "withdrawal",
-                6: "deposit",
-                7: "balance"
-            })
-            print(f"[DEBUG] DataFrame columns after renaming: {df.columns.tolist()}")
-            print(f"[DEBUG] DataFrame sample after renaming:\n{df.head(5)}")
-            
-            df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
-            df = add_transaction_type(df)
-            df = add_amount_column(df)
-            print(f"[DEBUG] Final parsed DataFrame sample:\n{df.head(5)}")
+            # ----------------------------------------------------
+            # After debugging, re-enable the following code:
+            #
+            # merged_df.drop_duplicates(inplace=True)
+            # filtered_df = filter_valid_transactions(merged_df)
+            # df = filtered_df
+            # df = df.rename(columns={
+            #     0: "date",
+            #     2: "description",
+            #     4: "withdrawal",
+            #     6: "deposit",
+            #     7: "balance"
+            # })
+            # print(f"[DEBUG] DataFrame columns after renaming: {df.columns.tolist()}")
+            # print(f"[DEBUG] DataFrame sample after renaming:\n{df.head(5)}")
+            # df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
+            # df = add_transaction_type(df)
+            # df = add_amount_column(df)
+            # print(f"[DEBUG] Final parsed DataFrame sample:\n{df.head(5)}")
             # ----------------------------------------------------
         
         elif bank_type == "axis bank":
