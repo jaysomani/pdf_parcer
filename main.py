@@ -80,7 +80,6 @@ def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
         df.columns = list(range(EXPECTED_NCOLS))
     elif current_ncols < EXPECTED_NCOLS:
         print(f"[DEBUG] Page {page_num} has fewer columns ({current_ncols}) than expected ({EXPECTED_NCOLS}). Padding missing columns.")
-        # For each missing column, add a new column filled with empty strings.
         for i in range(current_ncols, EXPECTED_NCOLS):
             df[i] = ""
         df = df[list(range(EXPECTED_NCOLS))]
@@ -373,10 +372,17 @@ async def process_pdf(
             
             combined_df = pd.concat(list(page_tables.values()), ignore_index=True)
             print(f"[DEBUG] Combined DataFrame shape before merge_multiline_rows: {combined_df.shape}")
+            
+            # For testing: if you want to return raw data before renaming,
+            # uncomment the following lines:
+            # raw_data = combined_df.to_dict(orient="records")
+            # return JSONResponse(status_code=200, content={"status": "raw", "data": raw_data})
+            
             combined_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
             combined_df.drop_duplicates(inplace=True)
             filtered_df = filter_valid_transactions(combined_df)
             df = filtered_df
+            
             # ------ Post processing: rename columns for clarity ------
             df = df.rename(columns={
                 0: "date",
@@ -385,13 +391,12 @@ async def process_pdf(
                 6: "deposit",
                 7: "balance"
             })
-            # Debug print the DataFrame after renaming
             print(f"[DEBUG] DataFrame columns after renaming: {df.columns.tolist()}")
             print(f"[DEBUG] DataFrame sample after renaming:\n{df.head(5)}")
+            
             df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
             df = add_transaction_type(df)
             df = add_amount_column(df)
-            # Debug print final parsed data sample
             print(f"[DEBUG] Final parsed DataFrame sample:\n{df.head(5)}")
             # ----------------------------------------------------
         
