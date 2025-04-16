@@ -377,33 +377,28 @@ async def process_pdf(
             merged_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
             print(f"[DEBUG] Merged DataFrame shape: {merged_df.shape}")
             
-            # Drop duplicates
+            # Drop duplicates and filter valid transactions
             merged_df.drop_duplicates(inplace=True)
-            # Filter valid transactions
             filtered_df = filter_valid_transactions(merged_df)
             print(f"[DEBUG] Filtered DataFrame shape: {filtered_df.shape}")
             
-            # ----- Temporary return of filtered data for debugging -----
-            raw_filtered = filtered_df.to_dict(orient="records")
-            return JSONResponse(status_code=200, content={"status": "filtered_raw", "data": raw_filtered})
-            # ----- End temporary block -----
+            # Process further after filtering
+            df = filtered_df
+            # Updated mapping as required:
+            df = df.rename(columns={
+                0: "date",
+                2: "description",
+                4: "withdrawal",
+                5: "deposit",   # Deposit from column 5
+                6: "balance"    # Balance from column 6
+            })
+            print(f"[DEBUG] DataFrame columns after renaming: {df.columns.tolist()}")
+            print(f"[DEBUG] DataFrame sample after renaming:\n{df.head(5)}")
             
-            # After debugging, once you are satisfied with the raw filtered data, re-enable the following steps:
-            #
-            # df = filtered_df
-            # df = df.rename(columns={
-            #     0: "date",
-            #     2: "description",
-            #     4: "withdrawal",
-            #     5: "deposit",   # Updated mapping: deposit is now at index 5
-            #     6: "balance"    # Updated mapping: balance is now at index 6
-            # })
-            # print(f"[DEBUG] DataFrame columns after renaming: {df.columns.tolist()}")
-            # print(f"[DEBUG] DataFrame sample after renaming:\n{df.head(5)}")
-            # df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
-            # df = add_transaction_type(df)
-            # df = add_amount_column(df)
-            # print(f"[DEBUG] Final parsed DataFrame sample:\n{df.head(5)}")
+            df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
+            df = add_transaction_type(df)
+            df = add_amount_column(df)
+            print(f"[DEBUG] Final parsed DataFrame sample:\n{df.head(5)}")
         
         elif bank_type == "axis bank":
             df = extract_table(pdf_file_path, flavor="stream", pages="all")
