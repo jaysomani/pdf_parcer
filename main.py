@@ -71,25 +71,33 @@ def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------------------------
 # Jalgaon-Specific Extraction Utility Functions
 # -------------------------------------------
-EXPECTED_NCOLS = 8  # Expect 8 columns: indices 0..7
+EXPECTED_NCOLS = 8  # Expect 8 columns
 
 def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
     current_ncols = df.shape[1]
+    print(f"[DEBUG] Page {page_num} - Original shape: {df.shape}")
+    print(f"[DEBUG] Page {page_num} - Data head before fix:\n{df.head(1)}")
+    
     if current_ncols == EXPECTED_NCOLS:
-        df.columns = range(EXPECTED_NCOLS)
-        return df
+        df.columns = list(range(EXPECTED_NCOLS))
     elif current_ncols < EXPECTED_NCOLS:
-        df.columns = range(current_ncols)
-        if current_ncols == 7:
-            df.insert(5, "blank", "")
-        df.columns = range(EXPECTED_NCOLS)
-        return df
+        print(f"[DEBUG] Page {page_num} has fewer columns ({current_ncols}) than expected ({EXPECTED_NCOLS}). Padding missing columns.")
+        # For each missing column, add a new column filled with empty strings.
+        for i in range(current_ncols, EXPECTED_NCOLS):
+            df[i] = ""
+        # Ensure df has exactly EXPECTED_NCOLS columns
+        df = df[list(range(EXPECTED_NCOLS))]
+        df.columns = list(range(EXPECTED_NCOLS))
+        print(f"[DEBUG] Page {page_num} - After padding: {df.shape}")
     else:
-        df.columns = range(current_ncols)
-        if current_ncols == 9:
-            df.drop(columns=[5], inplace=True)
-        df.columns = range(EXPECTED_NCOLS)
-        return df
+        print(f"[DEBUG] Page {page_num} has extra columns: {current_ncols}.")
+        if current_ncols == EXPECTED_NCOLS + 1:
+            df = df.drop(columns=[5])
+        else:
+            df = df.iloc[:, :EXPECTED_NCOLS]
+        df.columns = list(range(EXPECTED_NCOLS))
+        print(f"[DEBUG] Page {page_num} - After trimming: {df.shape}")
+    return df
 
 def is_date(val: str) -> bool:
     val = val.strip()
@@ -382,7 +390,6 @@ async def process_pdf(
             })
             df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
             df = add_transaction_type(df)
-            # Now, add an "amount" column:
             df = add_amount_column(df)
             # ----------------------------------------------------
         
