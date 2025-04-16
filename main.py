@@ -371,7 +371,8 @@ async def process_pdf(
                 raise HTTPException(status_code=400, detail="No valid tables found on any page.")
             
             combined_df = pd.concat(list(page_tables.values()), ignore_index=True)
-            print(f"[DEBUG] Combined DataFrame shape before merging multiline rows: {combined_df.shape}")
+            print(f"[DEBUG] Combined DataFrame shape before merge_multiline_rows: {combined_df.shape}")
+            
             # Merge multiline rows
             merged_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
             print(f"[DEBUG] Merged DataFrame shape: {merged_df.shape}")
@@ -387,15 +388,15 @@ async def process_pdf(
             return JSONResponse(status_code=200, content={"status": "filtered_raw", "data": raw_filtered})
             # ----- End temporary block -----
             
-            # After debugging raw filtered data, re-enable the following steps:
+            # After debugging, once you are satisfied with the raw filtered data, re-enable the following steps:
             #
             # df = filtered_df
             # df = df.rename(columns={
             #     0: "date",
             #     2: "description",
             #     4: "withdrawal",
-            #     6: "deposit",
-            #     7: "balance"
+            #     5: "deposit",   # Updated mapping: deposit is now at index 5
+            #     6: "balance"    # Updated mapping: balance is now at index 6
             # })
             # print(f"[DEBUG] DataFrame columns after renaming: {df.columns.tolist()}")
             # print(f"[DEBUG] DataFrame sample after renaming:\n{df.head(5)}")
