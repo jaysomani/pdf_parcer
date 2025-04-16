@@ -375,8 +375,8 @@ async def process_pdf(
             
             # For testing: if you want to return raw data before renaming,
             # uncomment the following lines:
-            # raw_data = combined_df.to_dict(orient="records")
-            # return JSONResponse(status_code=200, content={"status": "raw", "data": raw_data})
+            raw_data = combined_df.to_dict(orient="records")
+            return JSONResponse(status_code=200, content={"status": "raw", "data": raw_data})
             
             combined_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
             combined_df.drop_duplicates(inplace=True)
