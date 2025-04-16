@@ -21,10 +21,10 @@ from mangum import Mangum
 
 app = FastAPI()
 
-# Add CORS middleware here:
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Add your frontend URL(s)
+    allow_origins=["http://localhost:3000"],  # Update with your frontend URL(s)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,56 +33,76 @@ app.add_middleware(
 handler = Mangum(app)
 
 # -------------------------------------------
+# Helper Functions
+# -------------------------------------------
+
+def add_transaction_type(df: pd.DataFrame) -> pd.DataFrame:
+    def get_type(row):
+        try:
+            deposit = float(str(row["deposit"]).replace(",", "").strip() or 0)
+        except Exception:
+            deposit = 0
+        try:
+            withdrawal = float(str(row["withdrawal"]).replace(",", "").strip() or 0)
+        except Exception:
+            withdrawal = 0
+        if deposit > 0:
+            return "receipt"
+        elif withdrawal > 0:
+            return "payment"
+        else:
+            return "unknown"
+    df["type"] = df.apply(get_type, axis=1)
+    return df
+
+def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
+    # Create a new column "amount" based on the transaction type
+    def get_amount(row):
+        if row["type"] == "receipt":
+            return row["deposit"]
+        elif row["type"] == "payment":
+            return row["withdrawal"]
+        else:
+            return None
+    df["amount"] = df.apply(get_amount, axis=1)
+    # Return only the desired columns
+    return df[["date", "description", "balance", "type", "amount"]]
+
+# -------------------------------------------
 # Jalgaon-Specific Extraction Utility Functions
 # -------------------------------------------
-EXPECTED_NCOLS = 8  # Suppose we want 8 consistent columns: indices 0..7
+EXPECTED_NCOLS = 8  # Expect 8 columns: indices 0..7
 
 def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
-    """
-    Force 'df' to have EXACTLY EXPECTED_NCOLS columns in the right positions.
-    You can customize this logic depending on your PDF's pattern and page number.
-    """
     current_ncols = df.shape[1]
-    
     if current_ncols == EXPECTED_NCOLS:
-        # Perfect, rename columns to 0..7
         df.columns = range(EXPECTED_NCOLS)
         return df
-
     elif current_ncols < EXPECTED_NCOLS:
-        # Example logic: if it's missing one column, insert a blank
         df.columns = range(current_ncols)
         if current_ncols == 7:
-            # Insert a blank column at index 5 (example)
             df.insert(5, "blank", "")
         df.columns = range(EXPECTED_NCOLS)
         return df
-
     else:
-        # current_ncols > EXPECTED_NCOLS
         df.columns = range(current_ncols)
         if current_ncols == 9:
-            # Maybe drop column #5
             df.drop(columns=[5], inplace=True)
         df.columns = range(EXPECTED_NCOLS)
         return df
 
 def is_date(val: str) -> bool:
-    """Simple check if val is in DD/MM/YYYY or DD-MM-YYYY."""
     val = val.strip()
     return bool(re.match(r"^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$", val))
 
 def merge_multiline_rows(df: pd.DataFrame, date_col: int = 0, partic_col: int = 2) -> pd.DataFrame:
-    """Merge rows whose first cell is not a date into the previous row's 'particular' text."""
     merged_rows = []
     for i in range(len(df)):
         row = df.iloc[i].copy()
         first_cell = str(row[date_col]).strip()
         if not is_date(first_cell):
             if merged_rows:
-                merged_rows[-1][partic_col] = (
-                    str(merged_rows[-1][partic_col]) + " " + str(row[partic_col])
-                )
+                merged_rows[-1][partic_col] = str(merged_rows[-1][partic_col]) + " " + str(row[partic_col])
             else:
                 merged_rows.append(row)
         else:
@@ -90,30 +110,20 @@ def merge_multiline_rows(df: pd.DataFrame, date_col: int = 0, partic_col: int = 
     return pd.DataFrame(merged_rows, columns=df.columns)
 
 def is_valid_transaction(row) -> bool:
-    """
-    Decide if a row is a 'valid transaction':
-      - Column 0 is a valid date
-      - Column 3 is one of ["T", "L", "C"]
-    Adjust these rules as needed.
-    """
-    # Check date in column 0
     if not is_date(str(row[0])):
         return False
-    # Check transaction code in column 3
     valid_codes = {"T", "L", "C"}
     if str(row[3]) not in valid_codes:
         return False
     return True
 
 def filter_valid_transactions(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply is_valid_transaction to each row; keep only rows that pass."""
     mask = df.apply(is_valid_transaction, axis=1)
     return df[mask].copy()
 
 # -------------------------------------------
 # Other Extraction and Cleaning Functions
 # -------------------------------------------
-
 def deduplicate_columns(df):
     new_cols = []
     counts = {}
@@ -146,10 +156,8 @@ def extract_tables_pdfplumber(pdf_file):
                     df["page"] = page_num
                     all_dfs.append(df)
     if all_dfs:
-        combined_df = pd.concat(all_dfs, ignore_index=True)
-    else:
-        combined_df = pd.DataFrame()
-    return combined_df
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
 
 def detect_bank_type(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
@@ -186,8 +194,7 @@ def extract_icici3_with_pdfplumber(pdf_file):
                 all_rows.extend(tbl)
     if not all_rows:
         return pd.DataFrame()
-    df = pd.DataFrame(all_rows[1:], columns=all_rows[0])
-    return df
+    return pd.DataFrame(all_rows[1:], columns=all_rows[0])
 
 def extract_table(pdf_file, flavor="stream", pages="all", **kwargs):
     tables = camelot.read_pdf(pdf_file, flavor=flavor, pages=pages, **kwargs)
@@ -213,8 +220,7 @@ def merge_axis_rows(df, date_col="date"):
             i = j
         else:
             i += 1
-    merged_df = pd.DataFrame(merged_rows, columns=df.columns)
-    return merged_df
+    return pd.DataFrame(merged_rows, columns=df.columns)
 
 def transform_sbi(df):
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -261,16 +267,12 @@ def transform_sbi(df):
 # Utility Functions for Production Setup
 # -------------------------------------------
 def normalize_identifier(text):
-    """Normalize text (email, company) to be used in table names."""
     text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    return text
+    return re.sub(r"[^a-z0-9]+", "_", text)
 
 # -------------------------------------------
 # FastAPI Endpoints
 # -------------------------------------------
-
-# Endpoint to serve the HTML page for file upload and display of extracted data.
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     html_content = """
@@ -284,7 +286,6 @@ async def home(request: Request):
         <form id="uploadForm" enctype="multipart/form-data">
             <label>Email: <input type="text" name="email" placeholder="Enter your email" required></label><br>
             <label>Company: <input type="text" name="company" placeholder="Enter company name" required></label><br>
-            <!-- Hidden inputs for other form values -->
             <input type="hidden" name="uploaded_file" value="uploaded.pdf">
             <input type="hidden" name="user_group" value="gold">
             <label>File: <input type="file" name="file" accept="application/pdf" required></label><br>
@@ -310,12 +311,10 @@ async def home(request: Request):
     """
     return HTMLResponse(content=html_content)
 
-# Dummy endpoint to test if API is running.
 @app.get("/hello")
 def hello():
     return {"message": "Hello, world! API is working."}
 
-# Dummy endpoint to echo back the uploaded file details.
 @app.post("/echo-file")
 async def echo_file(file: UploadFile = File(...)):
     file_content = await file.read()
@@ -325,8 +324,6 @@ async def echo_file(file: UploadFile = File(...)):
         "content_base64": encoded_content
     })
 
-# Main endpoint: processes uploaded PDF, saves extracted data to files,
-# and returns the parsed output as JSON.
 @app.post("/process-pdf")
 async def process_pdf(
     email: str = Form(...),
@@ -335,7 +332,6 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # Read uploaded PDF data
     pdf_data = await file.read()
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         pdf_file_path = tmp.name
@@ -345,7 +341,6 @@ async def process_pdf(
         bank_type = detect_bank_type(pdf_file_path)
         print("Detected bank type:", bank_type)
         
-        # If unsupported bank type, return a message
         if bank_type == "unknown":
             return JSONResponse(status_code=200, content={"status": "unsupported bank type"})
         
@@ -365,24 +360,30 @@ async def process_pdf(
                 pnum = table.page
                 if pnum not in page_tables:
                     df_page = table.df.copy()
-                    # Fix columns to expected number
                     df_page = fix_columns_for_page(df_page, pnum)
-                    # Add page column for traceability
                     df_page["page"] = pnum
                     page_tables[pnum] = df_page
             
             if not page_tables:
                 raise HTTPException(status_code=400, detail="No valid tables found on any page.")
             
-            # Combine all pages into one DataFrame
             combined_df = pd.concat(list(page_tables.values()), ignore_index=True)
-            # Merge multi-line rows (assuming date is in column 0 and particulars in column 2)
             combined_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
-            # Drop duplicate rows if any
             combined_df.drop_duplicates(inplace=True)
-            # Filter for valid transactions using the new filter logic
             filtered_df = filter_valid_transactions(combined_df)
             df = filtered_df
+            # ------ Post processing: rename columns for clarity ------
+            df = df.rename(columns={
+                0: "date",
+                2: "description",
+                4: "withdrawal",
+                6: "deposit",
+                7: "balance"
+            })
+            df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
+            df = add_transaction_type(df)
+            # Now, add an "amount" column:
+            df = add_amount_column(df)
             # ----------------------------------------------------
         
         elif bank_type == "axis bank":
@@ -391,7 +392,6 @@ async def process_pdf(
                 df = extract_table(pdf_file_path, flavor="lattice", pages="all")
             if df is None or df.empty:
                 raise HTTPException(status_code=400, detail="No data extracted from PDF.")
-            # Use existing cleaning for axis bank
             df = merge_axis_rows(df, date_col="date")
         
         elif bank_type in ["idbi", "sbi new", "sbi", "pnb", "union bank"]:
@@ -414,10 +414,8 @@ async def process_pdf(
         if df is None or df.empty:
             raise HTTPException(status_code=400, detail="No data extracted from PDF.")
         
-        # Convert DataFrame to JSON (list of records) for final output
         parsed_data = df.to_dict(orient="records")
         
-        # Save final processed data to a JSON file
         with open("extracted_data.json", "w", encoding="utf-8") as f:
             json.dump(parsed_data, f, ensure_ascii=False, indent=4)
         
