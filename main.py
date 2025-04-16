@@ -371,20 +371,24 @@ async def process_pdf(
                 raise HTTPException(status_code=400, detail="No valid tables found on any page.")
             
             combined_df = pd.concat(list(page_tables.values()), ignore_index=True)
-            print(f"[DEBUG] Combined DataFrame shape before merge_multiline_rows: {combined_df.shape}")
-            
-            # Merge multiline rows and return the result for debugging raw merged data
+            print(f"[DEBUG] Combined DataFrame shape before merging multiline rows: {combined_df.shape}")
+            # Merge multiline rows
             merged_df = merge_multiline_rows(combined_df, date_col=0, partic_col=2)
             print(f"[DEBUG] Merged DataFrame shape: {merged_df.shape}")
-            # For testing: return the raw merged data as JSON
-            raw_merged = merged_df.to_dict(orient="records")
-            return JSONResponse(status_code=200, content={"status": "merged_raw", "data": raw_merged})
             
-            # ----------------------------------------------------
-            # After debugging, re-enable the following code:
+            # Drop duplicates
+            merged_df.drop_duplicates(inplace=True)
+            # Filter valid transactions
+            filtered_df = filter_valid_transactions(merged_df)
+            print(f"[DEBUG] Filtered DataFrame shape: {filtered_df.shape}")
+            
+            # ----- Temporary return of filtered data for debugging -----
+            raw_filtered = filtered_df.to_dict(orient="records")
+            return JSONResponse(status_code=200, content={"status": "filtered_raw", "data": raw_filtered})
+            # ----- End temporary block -----
+            
+            # After debugging raw filtered data, re-enable the following steps:
             #
-            # merged_df.drop_duplicates(inplace=True)
-            # filtered_df = filter_valid_transactions(merged_df)
             # df = filtered_df
             # df = df.rename(columns={
             #     0: "date",
@@ -399,7 +403,6 @@ async def process_pdf(
             # df = add_transaction_type(df)
             # df = add_amount_column(df)
             # print(f"[DEBUG] Final parsed DataFrame sample:\n{df.head(5)}")
-            # ----------------------------------------------------
         
         elif bank_type == "axis bank":
             df = extract_table(pdf_file_path, flavor="stream", pages="all")
