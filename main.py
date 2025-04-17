@@ -55,6 +55,14 @@ def merge_multiline_rows(df: pd.DataFrame, date_col=0, partic_col=2) -> pd.DataF
                 out[-1][partic_col] = f"{out[-1][partic_col]} {row[partic_col]}"
     return pd.DataFrame(out, columns=df.columns)
 
+def is_valid_transaction(row) -> bool:
+    if not is_date(str(row[0]).strip()):
+        return False
+    return str(row[3]) in {"T", "L", "C"}
+
+def filter_valid_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df.apply(is_valid_transaction, axis=1)].copy()
+
 def detect_bank_type(path: str) -> str:
     text = (pdfplumber.open(path).pages[0].extract_text() or "").lower()
     if "trndate valuedt particular insno / type withdrawals deposit balance" in text:
@@ -97,10 +105,12 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # save temp PDF
-    data = await file.read()
+    # Save incoming PDF to a temp file
+    pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp.write(data); tmp.flush(); tmp.close()
+    tmp.write(pdf_bytes)
+    tmp.flush()
+    tmp.close()
     path = tmp.name
 
     try:
@@ -109,12 +119,13 @@ async def process_pdf(
         if bank != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # try lattice, then stream fallback
+        # Attempt lattice extraction with stronger line detection
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
+            # Fallback to stream
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # merge chunks per page
+        # Merge all table chunks per page
         pages = defaultdict(list)
         for t in tables:
             dfc = t.df.copy()
@@ -126,24 +137,29 @@ async def process_pdf(
             raise HTTPException(400, "No tables extracted")
 
         combined = pd.concat(
-            [pd.concat(chs, ignore_index=True) for chs in pages.values()],
+            [pd.concat(chunks, ignore_index=True) for chunks in pages.values()],
             ignore_index=True
         )
 
-        # ==== RETURN MERGED (multiline) DATA FOR TESTING ==== #
+        # Merge multiline rows and drop duplicates
         merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
-        raw_merged = merged.to_dict(orient="records")
-        return JSONResponse({"status": "merged", "data": raw_merged})
 
-        # ==== FINAL PROCESSING (commented out during testing) ==== #
-        # valid = filter_valid_transactions(merged)
-        # df = valid.rename(columns={0:"date",2:"description",4:"withdrawal",6:"deposit",7:"balance"})
+        # ==== RETURN FILTERED-REAL-TRANSACTION DATA FOR TESTING ==== #
+        filtered = filter_valid_transactions(merged)
+        raw_filtered = filtered.to_dict(orient="records")
+        return JSONResponse({"status": "filtered", "data": raw_filtered})
+
+        # ==== Final steps (uncomment when ready) ==== #
+        # df = filtered.rename(columns={
+        #     0: "date", 2: "description", 4: "withdrawal",
+        #     6: "deposit", 7: "balance"
+        # })
         # df = df[["date","description","withdrawal","deposit","balance","page"]]
         # df = add_transaction_type(df)
         # df = add_amount_column(df)
-        # df = df[df["type"]!="unknown"]
-        # records = df.to_dict("records")
+        # df = df[df["type"] != "unknown"]
+        # records = df.to_dict(orient="records")
         # return JSONResponse({"status":"success","parsed_data":records})
 
     finally:
