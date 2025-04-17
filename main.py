@@ -16,6 +16,7 @@ import pandas as pd
 app = FastAPI()
 handler = Mangum(app)
 
+# Allow CORS for local frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -101,6 +102,7 @@ async def home(request: Request):
   <form enctype="multipart/form-data" method="post" action="/process-pdf">
     <label>Email: <input name="email" required></label><br>
     <label>Company: <input name="company" required></label><br>
+    <label>Temp Table: <input name="temp_table" required></label><br>
     <input type="hidden" name="uploaded_file" value="uploaded.pdf">
     <input type="hidden" name="user_group" value="gold">
     <label>File: <input type="file" name="file" accept="application/pdf" required></label><br>
@@ -121,11 +123,12 @@ async def home(request: Request):
 async def process_pdf(
     email: str = Form(...),
     company: str = Form(...),
+    temp_table: str = Form(...),
     uploaded_file: str = Form("uploaded.pdf"),
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # 1) Save uploaded PDF to temp
+    # 1) Save PDF to temp
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes); tmp.flush(); tmp.close()
@@ -166,7 +169,7 @@ async def process_pdf(
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # ── NEW: build a single‐line "entirechunk" string ──
+        # ── build a single‐line "entirechunk" string ──
         def build_chunk(r):
             parts = [ str(r[c]) for c in range(EXPECTED_NCOLS) ] + [ str(r["page"]) ]
             return "".join(parts)
@@ -196,12 +199,13 @@ async def process_pdf(
         )
         tol = 1e-2
         df["balance_match"] = (df["balance_num"] - df["expected_balance"]).abs() < tol
-        df.loc[0, "balance_match"] = True  # assume the first row checks out
+        df.loc[0, "balance_match"] = True  # first row assumed OK
 
-        # 11) Return final JSON
+        # 11) Return final JSON (including that temp_table field)
         return JSONResponse({
-            "status": "success",
-            "receipts": df.to_dict(orient="records")
+            "status":     "success",
+            "temp_table": temp_table,
+            "receipts":   df.to_dict(orient="records")
         })
 
     finally:
