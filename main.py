@@ -2,12 +2,12 @@
 
 import os
 import re
+import json
 import tempfile
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
-import httpx
 
 import pdfplumber
 import camelot
@@ -66,19 +66,17 @@ def detect_bank_type(path: str) -> str:
 
 def add_transaction_type(df: pd.DataFrame) -> pd.DataFrame:
     def pick_type(r):
-        w = float(r.get("withdrawal", 0) or 0)
-        d = float(r.get("deposit", 0) or 0)
-        if w > 0:
-            return "payment"
-        if d > 0:
-            return "receipt"
+        w = float(r["withdrawal"] or 0)
+        d = float(r["deposit"] or 0)
+        if w > 0:   return "payment"
+        if d > 0:   return "receipt"
         return "unknown"
     df["type"] = df.apply(pick_type, axis=1)
     return df
 
 def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
     df["amount"] = df.apply(
-        lambda r: float(r["withdrawal"]) if float(r.get("withdrawal", 0) or 0) > 0 else float(r.get("deposit", 0) or 0),
+        lambda r: float(r["withdrawal"]) if float(r["withdrawal"] or 0) > 0 else float(r["deposit"] or 0),
         axis=1
     )
     return df
@@ -130,25 +128,23 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # Save PDF to temp
+    # 1) Save PDF to temp
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp.write(pdf_bytes)
-    tmp.flush()
-    tmp.close()
+    tmp.write(pdf_bytes); tmp.flush(); tmp.close()
     path = tmp.name
 
     try:
-        # Detect bank
+        # 2) Detect bank
         if detect_bank_type(path) != "jalgaon":
-            return JSONResponse({"status": "unsupported bank type"})
+            return JSONResponse({"status":"unsupported bank type"})
 
-        # Extract tables via Camelot
+        # 3) Extract all tables (lattice → stream)
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # Keep only first table per page
+        # 4) Keep only the very first table on each page
         page_tables = {}
         for t in tables:
             if t.page not in page_tables:
@@ -159,58 +155,57 @@ async def process_pdf(
         if not page_tables:
             raise HTTPException(400, "No tables extracted")
 
-        # Combine, merge duplicates, filter
+        # 5) Combine, merge multiline & drop duplicates
         combined = pd.concat(page_tables.values(), ignore_index=True)
-        merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
+        merged   = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
+
+        # 6) Filter only real transactions
         filtered = filter_valid_transactions(merged)
 
-        # Fix blank balances
+        # 7) Fix rows where balance (col 7) is blank by shifting deposit→balance
         mask = filtered[7].astype(str) == ""
         if mask.any():
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # Build entirechunk
+        # ── build a single‐line "entirechunk" string ──
         def build_chunk(r):
-            parts = [str(r[c]) for c in range(EXPECTED_NCOLS)] + [str(r["page"])]
+            parts = [ str(r[c]) for c in range(EXPECTED_NCOLS) ] + [ str(r["page"]) ]
             return "".join(parts)
+
         filtered["entirechunk"] = filtered.apply(build_chunk, axis=1)
 
-        # Rename/select final columns
-        df = filtered.rename(columns={0: "date", 2: "description", 4: "withdrawal", 6: "deposit", 7: "balance"})
-        df = df[["date", "description", "withdrawal", "deposit", "balance", "page", "entirechunk"]]
+        # 8) Rename and select final columns (including entirechunk)
+        df = filtered.rename(columns={
+            0: "date", 2: "description", 4: "withdrawal",
+            6: "deposit", 7: "balance"
+        })
+        df = df[[
+            "date","description","withdrawal","deposit","balance","page","entirechunk"
+        ]]
 
-        # Add type, amount, balances
+        # 9) Add payment/receipt type & amount
         df = add_transaction_type(df)
         df = add_amount_column(df)
         df = df[df["type"] != "unknown"].reset_index(drop=True)
-        df["balance_num"] = df["balance"].apply(parse_balance)
-        df["prev_balance"] = df["balance_num"].shift(1).fillna(df["balance_num"].iloc[0])
-        df["expected_balance"] = df.apply(lambda r: r["prev_balance"] + (r["amount"] if r["type"]=="receipt" else -r["amount"]), axis=1)
+
+        # 10) Verify balances
+        df["balance_num"]      = df["balance"].apply(parse_balance)
+        df["prev_balance"]     = df["balance_num"].shift(1).fillna(df["balance_num"].iloc[0])
+        df["expected_balance"] = df.apply(
+            lambda r: r["prev_balance"] + (r["amount"] if r["type"]=="receipt" else -r["amount"]),
+            axis=1
+        )
         tol = 1e-2
         df["balance_match"] = (df["balance_num"] - df["expected_balance"]).abs() < tol
-        df.loc[0, "balance_match"] = True
+        df.loc[0, "balance_match"] = True  # first row assumed OK
 
-        # Prepare payload
-        receipts = df.to_dict(orient="records")
-        payload = {"temp_table": temp_table, "receipts": receipts}
-
-        # Push to Node endpoint
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "http://localhost:3001/api/insertParsedReceipts",
-                json=payload,
-                timeout=30.0
-            )
-        if resp.status_code >= 300:
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
-
-        # Return combined result
+        # 11) Return final JSON (including that temp_table field)
         return JSONResponse({
-            "status":       "success",
-            "temp_table":   temp_table,
-            "insertResult": resp.json()
+            "status":     "success",
+            "temp_table": temp_table,
+            "receipts":   df.to_dict(orient="records")
         })
 
     finally:
