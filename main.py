@@ -4,15 +4,15 @@ import os
 import re
 import json
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from mangum import Mangum
+from collections import defaultdict
 
 import pdfplumber
 import camelot
 import pandas as pd
-from collections import defaultdict
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from mangum import Mangum
 
 app = FastAPI()
 
@@ -68,6 +68,15 @@ def detect_bank_type(path: str) -> str:
     if "trndate valuedt particular insno / type withdrawals deposit balance" in text:
         return "jalgaon"
     return "unknown"
+
+# Stubs for post-processing you already have:
+def add_transaction_type(df):  # your existing logic
+    # e.g. df["type"] = df.apply(...)
+    return df
+
+def add_amount_column(df):   # your existing logic
+    # e.g. df["amount"] = ...
+    return df
 
 # -------------------------------------------
 # FastAPI Endpoints
@@ -151,20 +160,20 @@ async def process_pdf(
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # Return for testing
-        raw_filtered = filtered.to_dict(orient="records")
-        return JSONResponse({"status": "filtered", "data": raw_filtered})
-
-        # ----- when ready for production, rename & post-process -----
-        # df = filtered.rename(columns={
-        #     0: "date", 2: "description", 4: "withdrawal",
-        #     6: "deposit", 7: "balance"
-        # })
-        # df = df[["date","description","withdrawal","deposit","balance","page"]]
-        # df = add_transaction_type(df)
-        # df = add_amount_column(df)
-        # df = df[df["type"] != "unknown"]
-        # return JSONResponse({"status":"success","parsed_data":df.to_dict(orient="records")})
+        # ==== Final production steps ====
+        df = filtered.rename(columns={
+            0: "date",
+            2: "description",
+            4: "withdrawal",
+            6: "deposit",
+            7: "balance"
+        })
+        df = df[["date","description","withdrawal","deposit","balance","page"]]
+        df = add_transaction_type(df)
+        df = add_amount_column(df)
+        df = df[df["type"] != "unknown"]
+        records = df.to_dict(orient="records")
+        return JSONResponse({"status":"success","parsed_data":records})
 
     finally:
         os.remove(path)
