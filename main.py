@@ -14,8 +14,9 @@ import camelot
 import pandas as pd
 
 app = FastAPI()
+handler = Mangum(app)
 
-# CORS
+# Allow CORS for local frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -23,15 +24,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-handler = Mangum(app)
 
-# -------------------------------------------
-# Helpers
-# -------------------------------------------
 EXPECTED_NCOLS = 8
 
 def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
     n = df.shape[1]
+    # pad or trim to EXPECTED_NCOLS
     if n < EXPECTED_NCOLS:
         for i in range(n, EXPECTED_NCOLS):
             df[i] = ""
@@ -49,6 +47,7 @@ def merge_multiline_rows(df: pd.DataFrame, date_col=0, partic_col=2) -> pd.DataF
         if is_date(str(row[date_col])):
             out.append(row.copy())
         else:
+            # continuation of the previous row's description
             if out:
                 out[-1][partic_col] = f"{out[-1][partic_col]} {row[partic_col]}"
     return pd.DataFrame(out, columns=df.columns)
@@ -67,9 +66,26 @@ def detect_bank_type(path: str) -> str:
         return "jalgaon"
     return "unknown"
 
-# -------------------------------------------
-# FastAPI Endpoints
-# -------------------------------------------
+def add_transaction_type(df: pd.DataFrame) -> pd.DataFrame:
+    # withdrawal > 0 → payment; deposit > 0 → receipt
+    def pick_type(r):
+        w = float(r["withdrawal"] or 0)
+        d = float(r["deposit"] or 0)
+        if w > 0:
+            return "payment"
+        if d > 0:
+            return "receipt"
+        return "unknown"
+    df["type"] = df.apply(pick_type, axis=1)
+    return df
+
+def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
+    df["amount"] = df.apply(
+        lambda r: float(r["withdrawal"]) if float(r["withdrawal"] or 0) > 0 else float(r["deposit"] or 0),
+        axis=1
+    )
+    return df
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return HTMLResponse("""
@@ -102,7 +118,7 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # Save PDF to temp
+    # 1) save upload
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)
@@ -111,16 +127,17 @@ async def process_pdf(
     path = tmp.name
 
     try:
+        # 2) detect bank
         bank = detect_bank_type(path)
         if bank != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # Try lattice then stream
+        # 3) extract tables (lattice → stream)
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # Keep only the first table per page
+        # 4) keep only the first table per page
         page_tables = {}
         for t in tables:
             p = t.page
@@ -133,22 +150,21 @@ async def process_pdf(
         if not page_tables:
             raise HTTPException(400, "No tables extracted")
 
+        # 5) combine, merge multiline, dedupe
         combined = pd.concat(list(page_tables.values()), ignore_index=True)
-
-        # Merge multi-line rows & drop duplicates
         merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
 
-        # Filter to only real transactions
+        # 6) filter for real transactions
         filtered = filter_valid_transactions(merged)
 
-        # Fix any rows where balance (col 7) is blank by shifting columns up
+        # 7) fix any rows where balance (col 7) is blank by shifting deposit→balance
         mask = filtered[7].astype(str) == ""
         if mask.any():
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # ===== now rename columns and return final parsed_data =====
+        # 8) rename columns
         df = filtered.rename(columns={
             0: "date",
             2: "description",
@@ -156,12 +172,19 @@ async def process_pdf(
             6: "deposit",
             7: "balance"
         })
-        df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
+        df = df[["date","description","withdrawal","deposit","balance","page"]]
 
-        return JSONResponse({
-            "status": "success",
-            "parsed_data": df.to_dict(orient="records")
-        })
+        # 9) add type & amount
+        df = add_transaction_type(df)
+        df = add_amount_column(df)
+
+        # 10) drop any unknowns
+        df = df[df["type"] != "unknown"]
+
+        # 11) build the final JSON receipts/payments
+        receipts = df.to_dict(orient="records")
+
+        return JSONResponse({"status":"success","receipts": receipts})
 
     finally:
         os.remove(path)
