@@ -13,11 +13,11 @@ import pdfplumber
 import camelot
 import pandas as pd
 import numpy as np
-from collections import defaultdict
 
 app = FastAPI()
+handler = Mangum(app)
 
-# CORS
+# Allow CORS for local frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -25,16 +25,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-handler = Mangum(app)
 
-# -------------------------------------------
-# Helpers
-# -------------------------------------------
 EXPECTED_NCOLS = 8
 
 def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
     n = df.shape[1]
-    # pad or trim to EXPECTED_NCOLS
     if n < EXPECTED_NCOLS:
         for i in range(n, EXPECTED_NCOLS):
             df[i] = ""
@@ -70,26 +65,42 @@ def detect_bank_type(path: str) -> str:
         return "jalgaon"
     return "unknown"
 
+def add_transaction_type(df: pd.DataFrame) -> pd.DataFrame:
+    def pick_type(r):
+        w = float(r["withdrawal"] or 0)
+        d = float(r["deposit"] or 0)
+        if w > 0:
+            return "payment"
+        if d > 0:
+            return "receipt"
+        return "unknown"
+    df["type"] = df.apply(pick_type, axis=1)
+    return df
+
+def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
+    df["amount"] = df.apply(
+        lambda r: float(r["withdrawal"]) if float(r["withdrawal"] or 0) > 0 else float(r["deposit"] or 0),
+        axis=1
+    )
+    return df
+
 def parse_balance(s: str) -> float:
-    """Convert '2713.47Cr' → +2713.47, and '123.45Dr' → -123.45"""
+    """Convert '2713.47Cr'→+2713.47 and '123.45Dr'→–123.45"""
     s = s.replace(",", "").strip()
     if s.endswith("Cr"):
+        val = s[:-2]
         sign = 1
-        num = s[:-2]
     elif s.endswith("Dr"):
+        val = s[:-2]
         sign = -1
-        num = s[:-2]
     else:
+        val = s
         sign = 1
-        num = s
     try:
-        return sign * float(num)
-    except ValueError:
+        return sign * float(val)
+    except:
         return 0.0
 
-# -------------------------------------------
-# FastAPI Endpoints
-# -------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return HTMLResponse("""
@@ -122,7 +133,7 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # Save PDF to temp
+    # 1) save PDF
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)
@@ -131,16 +142,17 @@ async def process_pdf(
     path = tmp.name
 
     try:
+        # 2) detect bank
         bank = detect_bank_type(path)
         if bank != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # 1) Extract tables: lattice → fallback stream
+        # 3) extract tables
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # 2) Keep only the first table per page
+        # 4) first table per page
         page_tables = {}
         for t in tables:
             p = t.page
@@ -153,46 +165,47 @@ async def process_pdf(
         if not page_tables:
             raise HTTPException(400, "No tables extracted")
 
-        # 3) Combine, merge multiline rows, dedupe, filter real txns
+        # 5) combine, merge, dedupe, filter
         combined = pd.concat(list(page_tables.values()), ignore_index=True)
         merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
         filtered = filter_valid_transactions(merged)
 
-        # 4) Fix any rows where balance (col 7) is blank: shift up
+        # 6) fix blank balances by shifting
         mask = filtered[7].astype(str) == ""
         if mask.any():
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # 5) Rename columns and compute type/amount
+        # 7) rename cols & keep
         df = filtered.rename(columns={
-            0: "date",
-            2: "description",
-            4: "withdrawal",
-            6: "deposit",
-            7: "balance"
+            0: "date", 2: "description", 4: "withdrawal",
+            6: "deposit", 7: "balance"
         })
-        df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
+        df = df[["date","description","withdrawal","deposit","balance","page"]]
 
-        # determine whether it's receipt vs payment
-        df["type"] = df["withdrawal"].astype(float).apply(lambda x: "payment" if x > 0 else "receipt")
-        df["amount"] = df.apply(lambda r: float(r["withdrawal"]) if r["type"]=="payment" else float(r["deposit"]), axis=1)
+        # 8) type, amount
+        df = add_transaction_type(df)
+        df = add_amount_column(df)
+        df = df[df["type"] != "unknown"].reset_index(drop=True)
 
-        # 6) Balance verification
+        # 9) balance verification
         df["balance_num"] = df["balance"].apply(parse_balance)
-        df["prev_balance"] = df["balance_num"].shift(1)
-        df["expected_balance"] = df["prev_balance"] + np.where(df["type"]=="receipt", df["amount"], -df["amount"])
-        # treat first row as matching
+        df["prev_balance"] = df["balance_num"].shift(1).fillna(df["balance_num"].iloc[0])
+        df["expected_balance"] = df.apply(
+            lambda r: r["prev_balance"] + (r["amount"] if r["type"]=="receipt" else -r["amount"]),
+            axis=1
+        )
         tol = 1e-2
-        df["balance_match"] = ((df["balance_num"] - df["expected_balance"]).abs() < tol)
-        df.loc[df.index[0], "balance_match"] = True
+        df["balance_match"] = (df["balance_num"] - df["expected_balance"]).abs() < tol
+        df.loc[0, "balance_match"] = True  # first row always assumed OK
 
-        # 7) Return everything for inspection
+        # 10) return final JSON
         return JSONResponse({
-            "status": "filtered_with_verification",
-            "data": df.to_dict(orient="records")
+            "status":"success",
+            "receipts": df.to_dict(orient="records")
         })
 
     finally:
         os.remove(path)
+
