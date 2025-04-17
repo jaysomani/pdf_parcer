@@ -26,15 +26,10 @@ app.add_middleware(
 )
 handler = Mangum(app)
 
-# -------------------------------------------
-# Helpers
-# -------------------------------------------
-
 EXPECTED_NCOLS = 8
 
 def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
     n = df.shape[1]
-    # pad or trim to EXPECTED_NCOLS
     if n < EXPECTED_NCOLS:
         for i in range(n, EXPECTED_NCOLS):
             df[i] = ""
@@ -52,7 +47,6 @@ def merge_multiline_rows(df: pd.DataFrame, date_col=0, partic_col=2) -> pd.DataF
         if is_date(str(row[date_col])):
             out.append(row.copy())
         else:
-            # append continuation to last row
             if out:
                 out[-1][partic_col] = f"{out[-1][partic_col]} {row[partic_col]}"
     return pd.DataFrame(out, columns=df.columns)
@@ -70,10 +64,6 @@ def detect_bank_type(path: str) -> str:
     if "trndate valuedt particular insno / type withdrawals deposit balance" in text:
         return "jalgaon"
     return "unknown"
-
-# -------------------------------------------
-# FastAPI Endpoints
-# -------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -107,7 +97,6 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # save PDF to temp
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)
@@ -117,50 +106,42 @@ async def process_pdf(
 
     try:
         bank = detect_bank_type(path)
-        print(f"[DEBUG] Detected bank type: {bank!r}")
         if bank != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # first try lattice, then stream
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # keep only the first table per page
-        page_tables = {}
+        # collect all table‐chunks per page
+        pages = defaultdict(list)
         for t in tables:
-            p = t.page
-            if p not in page_tables:
-                dfc = t.df.copy()
-                dfc = fix_columns_for_page(dfc, p)
-                dfc["page"] = p
-                page_tables[p] = dfc
+            dfc = t.df.copy()
+            dfc = fix_columns_for_page(dfc, t.page)
+            dfc["page"] = t.page
+            pages[t.page].append(dfc)
 
-        if not page_tables:
-            raise HTTPException(400, "No tables extracted")
+        # for each page, keep only the first chunk where neither col 5 nor col 7 is entirely blank
+        clean_chunks = []
+        for p, chunks in pages.items():
+            for dfc in chunks:
+                col5_blank = dfc[5].astype(str).eq("").all()
+                col7_blank = dfc[7].astype(str).eq("").all()
+                if not (col5_blank or col7_blank):
+                    clean_chunks.append(dfc)
+                    break  # only the first valid chunk per page
 
-        # combine the one table per page
-        combined = pd.concat(list(page_tables.values()), ignore_index=True)
+        if not clean_chunks:
+            raise HTTPException(400, "No valid table found on any page")
 
-        # merge multi‐line descriptions, drop duplicates
+        combined = pd.concat(clean_chunks, ignore_index=True)
         merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
-
-        # filter to only real transactions
         filtered = filter_valid_transactions(merged)
+
+        # return for testing
         raw_filtered = filtered.to_dict(orient="records")
         return JSONResponse({"status": "filtered", "data": raw_filtered})
-
-        # ----- when you’re ready to go live, uncomment below -----
-        # df = filtered.rename(columns={
-        #     0: "date", 2: "description", 4: "withdrawal",
-        #     6: "deposit", 7: "balance"
-        # })
-        # df = df[["date","description","withdrawal","deposit","balance","page"]]
-        # df = add_transaction_type(df)
-        # df = add_amount_column(df)
-        # df = df[df["type"] != "unknown"]
-        # return JSONResponse({"status":"success","parsed_data":df.to_dict(orient="records")})
 
     finally:
         os.remove(path)
