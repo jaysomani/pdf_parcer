@@ -8,6 +8,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
+import httpx
 
 import pdfplumber
 import camelot
@@ -128,23 +129,22 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # 1) Save PDF to temp
+    # Save PDF to temp
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes); tmp.flush(); tmp.close()
     path = tmp.name
 
     try:
-        # 2) Detect bank
+        # Detect bank
         if detect_bank_type(path) != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # 3) Extract all tables (lattice → stream)
+        # Extract tables
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # 4) Keep only the very first table on each page
         page_tables = {}
         for t in tables:
             if t.page not in page_tables:
@@ -155,58 +155,58 @@ async def process_pdf(
         if not page_tables:
             raise HTTPException(400, "No tables extracted")
 
-        # 5) Combine, merge multiline & drop duplicates
         combined = pd.concat(page_tables.values(), ignore_index=True)
         merged   = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
-
-        # 6) Filter only real transactions
         filtered = filter_valid_transactions(merged)
 
-        # 7) Fix rows where balance (col 7) is blank by shifting deposit→balance
         mask = filtered[7].astype(str) == ""
         if mask.any():
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # ── build a single‐line "entirechunk" string ──
         def build_chunk(r):
-            parts = [ str(r[c]) for c in range(EXPECTED_NCOLS) ] + [ str(r["page"]) ]
+            parts = [str(r[c]) for c in range(EXPECTED_NCOLS)] + [str(r["page"])]
             return "".join(parts)
-
         filtered["entirechunk"] = filtered.apply(build_chunk, axis=1)
 
-        # 8) Rename and select final columns (including entirechunk)
-        df = filtered.rename(columns={
-            0: "date", 2: "description", 4: "withdrawal",
-            6: "deposit", 7: "balance"
-        })
-        df = df[[
-            "date","description","withdrawal","deposit","balance","page","entirechunk"
-        ]]
+        df = filtered.rename(columns={0:"date", 2:"description", 4:"withdrawal", 6:"deposit", 7:"balance"})
+        df = df[["date","description","withdrawal","deposit","balance","page","entirechunk"]]
 
-        # 9) Add payment/receipt type & amount
         df = add_transaction_type(df)
         df = add_amount_column(df)
         df = df[df["type"] != "unknown"].reset_index(drop=True)
 
-        # 10) Verify balances
         df["balance_num"]      = df["balance"].apply(parse_balance)
         df["prev_balance"]     = df["balance_num"].shift(1).fillna(df["balance_num"].iloc[0])
         df["expected_balance"] = df.apply(
-            lambda r: r["prev_balance"] + (r["amount"] if r["type"]=="receipt" else -r["amount"]),
-            axis=1
+            lambda r: r["prev_balance"] + (r["amount"] if r["type"]=="receipt" else -r["amount"]), axis=1
         )
         tol = 1e-2
         df["balance_match"] = (df["balance_num"] - df["expected_balance"]).abs() < tol
-        df.loc[0, "balance_match"] = True  # first row assumed OK
+        df.loc[0, "balance_match"] = True
 
-        # 11) Return final JSON (including that temp_table field)
-        return JSONResponse({
-            "status":     "success",
-            "temp_table": temp_table,
-            "receipts":   df.to_dict(orient="records")
-        })
+        # Build response payload
+        payload = {"status":"success", "temp_table": temp_table, "receipts": df.to_dict(orient="records")}  
+        
+        # If gold user, push to Node API
+        if user_group.lower() == "gold":
+            async with httpx.AsyncClient() as client:
+                node_resp = await client.post(
+                    "http://localhost:3001/api/insertParsedReceipts",
+                    json={"temp_table": temp_table, "receipts": df.to_dict(orient="records")},
+                    timeout=30.0
+                )
+            if node_resp.status_code >= 300:
+                return JSONResponse(status_code=node_resp.status_code, content=node_resp.json())
+            return JSONResponse({
+                "status":       "success",
+                "temp_table":   temp_table,
+                "insertResult": node_resp.json()
+            })
+
+        # Non-gold: return parsed data only
+        return JSONResponse(payload)
 
     finally:
         os.remove(path)
