@@ -12,7 +12,6 @@ from mangum import Mangum
 import pdfplumber
 import camelot
 import pandas as pd
-from collections import defaultdict
 
 app = FastAPI()
 
@@ -33,7 +32,6 @@ EXPECTED_NCOLS = 8
 
 def fix_columns_for_page(df: pd.DataFrame, page_num: int) -> pd.DataFrame:
     n = df.shape[1]
-    # pad or trim to EXPECTED_NCOLS
     if n < EXPECTED_NCOLS:
         for i in range(n, EXPECTED_NCOLS):
             df[i] = ""
@@ -137,34 +135,33 @@ async def process_pdf(
 
         combined = pd.concat(list(page_tables.values()), ignore_index=True)
 
-        # Merge multi-line rows & de-dupe
+        # Merge multi-line rows & drop duplicates
         merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
 
         # Filter to only real transactions
         filtered = filter_valid_transactions(merged)
 
-        # --- NEW: fix any rows where balance (col 7) is blank ---
+        # Fix any rows where balance (col 7) is blank by shifting columns up
         mask = filtered[7].astype(str) == ""
         if mask.any():
-            # shift up: balance ← old col6; deposit ← old col5
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # Return for testing
-        raw_filtered = filtered.to_dict(orient="records")
-        return JSONResponse({"status": "filtered", "data": raw_filtered})
-
-
+        # ===== now rename columns and return final parsed_data =====
         df = filtered.rename(columns={
-            0: "date", 2: "description", 4: "withdrawal",
-            6: "deposit", 7: "balance"
+            0: "date",
+            2: "description",
+            4: "withdrawal",
+            6: "deposit",
+            7: "balance"
         })
-        df = df[["date","description","withdrawal","deposit","balance","page"]]
-        df = add_transaction_type(df)
-        df = add_amount_column(df)
-        df = df[df["type"] != "unknown"]
-        return JSONResponse({"status":"success","parsed_data":df.to_dict(orient="records")})
+        df = df[["date", "description", "withdrawal", "deposit", "balance", "page"]]
+
+        return JSONResponse({
+            "status": "success",
+            "parsed_data": df.to_dict(orient="records")
+        })
 
     finally:
         os.remove(path)
