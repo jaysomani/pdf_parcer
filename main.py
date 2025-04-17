@@ -12,12 +12,10 @@ from mangum import Mangum
 import pdfplumber
 import camelot
 import pandas as pd
-import numpy as np
 
 app = FastAPI()
 handler = Mangum(app)
 
-# Allow CORS for local frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -69,10 +67,8 @@ def add_transaction_type(df: pd.DataFrame) -> pd.DataFrame:
     def pick_type(r):
         w = float(r["withdrawal"] or 0)
         d = float(r["deposit"] or 0)
-        if w > 0:
-            return "payment"
-        if d > 0:
-            return "receipt"
+        if w > 0:   return "payment"
+        if d > 0:   return "receipt"
         return "unknown"
     df["type"] = df.apply(pick_type, axis=1)
     return df
@@ -85,7 +81,6 @@ def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def parse_balance(s: str) -> float:
-    """Convert '2713.47Cr'→+2713.47 and '123.45Dr'→–123.45"""
     s = s.replace(",", "").strip()
     if s.endswith("Cr"):
         val, sign = s[:-2], 1
@@ -130,23 +125,23 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # 1) save PDF
+    # 1) Save uploaded PDF to temp
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes); tmp.flush(); tmp.close()
     path = tmp.name
 
     try:
-        # 2) detect bank
+        # 2) Detect bank
         if detect_bank_type(path) != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # 3) extract tables (lattice → stream)
+        # 3) Extract all tables (lattice → stream)
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # 4) keep first table per page
+        # 4) Keep only the very first table on each page
         page_tables = {}
         for t in tables:
             if t.page not in page_tables:
@@ -157,35 +152,42 @@ async def process_pdf(
         if not page_tables:
             raise HTTPException(400, "No tables extracted")
 
-        # 5) combine, merge, dedupe, filter
+        # 5) Combine, merge multiline & drop duplicates
         combined = pd.concat(page_tables.values(), ignore_index=True)
         merged   = merge_multiline_rows(combined, date_col=0, partic_col=2)
         merged.drop_duplicates(inplace=True)
+
+        # 6) Filter only real transactions
         filtered = filter_valid_transactions(merged)
 
-        # 6) fix blank balances by shifting
+        # 7) Fix rows where balance (col 7) is blank by shifting deposit→balance
         mask = filtered[7].astype(str) == ""
         if mask.any():
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
             filtered.loc[mask, 6] = filtered.loc[mask, 5]
 
-        # ── NEW ──  
-        # 7) attach every row’s full, raw data as “entirechunk”
-        filtered["entirechunk"] = filtered.to_dict(orient="records")
+        # ── NEW: build a single‐line "entirechunk" string ──
+        def build_chunk(r):
+            parts = [ str(r[c]) for c in range(EXPECTED_NCOLS) ] + [ str(r["page"]) ]
+            return "".join(parts)
 
-        # 8) rename & select (now including entirechunk)
+        filtered["entirechunk"] = filtered.apply(build_chunk, axis=1)
+
+        # 8) Rename and select final columns (including entirechunk)
         df = filtered.rename(columns={
             0: "date", 2: "description", 4: "withdrawal",
             6: "deposit", 7: "balance"
         })
-        df = df[["date","description","withdrawal","deposit","balance","page","entirechunk"]]
+        df = df[[
+            "date","description","withdrawal","deposit","balance","page","entirechunk"
+        ]]
 
-        # 9) add type & amount
+        # 9) Add payment/receipt type & amount
         df = add_transaction_type(df)
         df = add_amount_column(df)
         df = df[df["type"] != "unknown"].reset_index(drop=True)
 
-        # 10) balance verification
+        # 10) Verify balances
         df["balance_num"]      = df["balance"].apply(parse_balance)
         df["prev_balance"]     = df["balance_num"].shift(1).fillna(df["balance_num"].iloc[0])
         df["expected_balance"] = df.apply(
@@ -194,11 +196,11 @@ async def process_pdf(
         )
         tol = 1e-2
         df["balance_match"] = (df["balance_num"] - df["expected_balance"]).abs() < tol
-        df.loc[0, "balance_match"] = True  # assume first is OK
+        df.loc[0, "balance_match"] = True  # assume the first row checks out
 
-        # 11) return
+        # 11) Return final JSON
         return JSONResponse({
-            "status":"success",
+            "status": "success",
             "receipts": df.to_dict(orient="records")
         })
 
