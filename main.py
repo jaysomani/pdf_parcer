@@ -15,8 +15,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
 app = FastAPI()
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -25,10 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 handler = Mangum(app)
-
-# -------------------------------------------
-# Helpers
-# -------------------------------------------
 
 EXPECTED_NCOLS = 8
 
@@ -55,23 +49,51 @@ def merge_multiline_rows(df: pd.DataFrame, date_col=0, partic_col=2) -> pd.DataF
                 out[-1][partic_col] = f"{out[-1][partic_col]} {row[partic_col]}"
     return pd.DataFrame(out, columns=df.columns)
 
+def realign_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If balance (col 7) is blank but col 6 ends with Cr/Dr,
+    shift col 6→col7 and blank col6.
+    """
+    pattern = re.compile(r".*(Cr|Dr)$")
+    for idx, row in df.iterrows():
+        bal = str(row[7]).strip()
+        dep = str(row[6]).strip()
+        if not pattern.match(bal) and pattern.match(dep):
+            df.at[idx, 7] = dep
+            df.at[idx, 6] = ""
+    return df
+
 def is_valid_transaction(row) -> bool:
     if not is_date(str(row[0]).strip()):
         return False
-    return str(row[3]) in {"T", "L", "C"}
+    return str(row[3]).strip() in {"T", "L", "C"}
 
 def filter_valid_transactions(df: pd.DataFrame) -> pd.DataFrame:
     return df[df.apply(is_valid_transaction, axis=1)].copy()
+
+def add_transaction_type(df: pd.DataFrame) -> pd.DataFrame:
+    def get_type(r):
+        d = float(str(r["deposit"]).replace(",", "") or 0)
+        w = float(str(r["withdrawal"]).replace(",", "") or 0)
+        if d > 0: return "receipt"
+        if w > 0: return "payment"
+        return "unknown"
+    df["type"] = df.apply(get_type, axis=1)
+    return df
+
+def add_amount_column(df: pd.DataFrame) -> pd.DataFrame:
+    df["amount"] = df.apply(
+        lambda r: r["deposit"] if r["type"]=="receipt"
+                  else (r["withdrawal"] if r["type"]=="payment" else None),
+        axis=1
+    )
+    return df[["date","description","balance","type","amount"]]
 
 def detect_bank_type(path: str) -> str:
     text = (pdfplumber.open(path).pages[0].extract_text() or "").lower()
     if "trndate valuedt particular insno / type withdrawals deposit balance" in text:
         return "jalgaon"
     return "unknown"
-
-# -------------------------------------------
-# FastAPI
-# -------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -90,7 +112,7 @@ async def home(request: Request):
   <script>
     document.querySelector("form").onsubmit = async e => {
       e.preventDefault();
-      let res = await fetch("/process-pdf", { method:"POST", body:new FormData(e.target) });
+      const res = await fetch("/process-pdf", { method:"POST", body:new FormData(e.target) });
       document.getElementById("result").innerText = JSON.stringify(await res.json(),null,2);
     };
   </script>
@@ -105,27 +127,24 @@ async def process_pdf(
     user_group: str = Form("gold"),
     file: UploadFile = File(...)
 ):
-    # Save incoming PDF to a temp file
+    # Save to temp PDF
     pdf_bytes = await file.read()
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.write(pdf_bytes)
-    tmp.flush()
     tmp.close()
     path = tmp.name
 
     try:
         bank = detect_bank_type(path)
-        print(f"[DEBUG] Detected bank type: {bank!r}")
         if bank != "jalgaon":
             return JSONResponse({"status":"unsupported bank type"})
 
-        # Attempt lattice extraction with stronger line detection
+        # lattice → stream fallback
         tables = camelot.read_pdf(path, flavor="lattice", pages="all", line_scale=50, split_text=False)
         if not tables:
-            # Fallback to stream
             tables = camelot.read_pdf(path, flavor="stream", pages="all", strip_text="\n", edge_tol=200)
 
-        # Merge all table chunks per page
+        # collect chunks per page
         pages = defaultdict(list)
         for t in tables:
             dfc = t.df.copy()
@@ -136,31 +155,35 @@ async def process_pdf(
         if not pages:
             raise HTTPException(400, "No tables extracted")
 
+        # concat all chunks
         combined = pd.concat(
-            [pd.concat(chunks, ignore_index=True) for chunks in pages.values()],
+            [pd.concat(chs, ignore_index=True) for chs in pages.values()],
             ignore_index=True
         )
 
-        # Merge multiline rows and drop duplicates
+        # merge multiline, then realign any shifted rows
         merged = merge_multiline_rows(combined, date_col=0, partic_col=2)
+        merged = realign_columns(merged)
         merged.drop_duplicates(inplace=True)
 
-        # ==== RETURN FILTERED-REAL-TRANSACTION DATA FOR TESTING ==== #
+        # filter to real transactions
         filtered = filter_valid_transactions(merged)
-        raw_filtered = filtered.to_dict(orient="records")
-        return JSONResponse({"status": "filtered", "data": raw_filtered})
 
-        # ==== Final steps (uncomment when ready) ==== #
-        # df = filtered.rename(columns={
-        #     0: "date", 2: "description", 4: "withdrawal",
-        #     6: "deposit", 7: "balance"
-        # })
-        # df = df[["date","description","withdrawal","deposit","balance","page"]]
-        # df = add_transaction_type(df)
-        # df = add_amount_column(df)
-        # df = df[df["type"] != "unknown"]
-        # records = df.to_dict(orient="records")
-        # return JSONResponse({"status":"success","parsed_data":records})
+        # rename & select
+        df = filtered.rename(columns={
+            0: "date", 2: "description", 4: "withdrawal",
+            6: "deposit", 7: "balance"
+        })[["date","description","withdrawal","deposit","balance","page"]]
+
+        # classify & amount
+        df = add_transaction_type(df)
+        df = add_amount_column(df)
+
+        # drop any leftover unknowns
+        df = df[df["type"]!="unknown"]
+
+        records = df.to_dict(orient="records")
+        return JSONResponse({"status":"success","parsed_data":records})
 
     finally:
         os.remove(path)
