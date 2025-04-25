@@ -16,11 +16,11 @@ import pandas as pd
 app = FastAPI()
 handler = Mangum(app)
 
-# Allow CORS for local frontend
+# Allow CORS for all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when using wildcard origins
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -163,7 +163,7 @@ async def process_pdf(
         # 6) Filter only real transactions
         filtered = filter_valid_transactions(merged)
 
-        # 7) Fix rows where balance (col 7) is blank by shifting deposit→balance
+        # 7) Fix rows where balance (col 7) is blank by shifting deposit→balance
         mask = filtered[7].astype(str) == ""
         if mask.any():
             filtered.loc[mask, 7] = filtered.loc[mask, 6]
